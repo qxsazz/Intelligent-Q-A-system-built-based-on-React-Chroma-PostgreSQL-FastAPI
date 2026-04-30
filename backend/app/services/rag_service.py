@@ -41,17 +41,33 @@ class RagService:
         retrieval_query = await self._rewrite_for_retrieval(question)
         embeddings, embedding_tokens = await self.client.embed_texts([retrieval_query])
         query_embedding = embeddings[0]
-        hits = self.vector_store.search_hybrid(
-            query_text=retrieval_query,
-            query_embedding=query_embedding,
-            top_k=self.settings.retrieve_top_k,
-            dense_candidate_k=self.settings.retrieve_top_k,
-        )
-        hits, rerank_tokens = await self._rerank_hits(
-            query_embedding=query_embedding,
-            hits=hits,
-            final_top_k=self.settings.rerank_top_k,
-        )
+        if self.settings.enable_balanced_retrieval:
+            candidate_top_k = max(self.settings.retrieve_top_k * self.settings.balanced_candidate_factor, self.settings.retrieve_top_k)
+            hits = self.vector_store.search_balanced_hybrid(
+                query_text=retrieval_query,
+                query_embedding=query_embedding,
+                top_k=self.settings.retrieve_top_k,
+                dense_candidate_k=self.settings.retrieve_top_k,
+                per_file_top_n=max(self.settings.per_file_top_n, 1),
+                candidate_top_k=candidate_top_k,
+            )
+        else:
+            hits = self.vector_store.search_hybrid(
+                query_text=retrieval_query,
+                query_embedding=query_embedding,
+                top_k=self.settings.retrieve_top_k,
+                dense_candidate_k=self.settings.retrieve_top_k,
+            )
+        if self.settings.enable_rerank:
+            hits, rerank_tokens = await self._rerank_hits(
+                query_text=retrieval_query,
+                query_embedding=query_embedding,
+                hits=hits,
+                final_top_k=self.settings.rerank_top_k,
+            )
+        else:
+            rerank_tokens = 0
+            hits = hits[: self.settings.rerank_top_k]
         if not hits:
             fallback = "我在知识库中没有检索到足够信息，请先补充相关文档后再试。"
             yield {"event": "sources", "data": []}
@@ -61,16 +77,39 @@ class RagService:
             yield {"event": "done", "data": {"ok": True}}
             return
 
-        context = "\n\n".join([f"[{idx + 1}] {item['content']}" for idx, item in enumerate(hits)])
+        threshold = max(self.settings.min_relevance_for_context, 0.0)
+        # 先按阈值过滤掉低分来源，再决定是否还有足够高置信度的来源可用
+        filtered_hits = [item for item in hits if float(item.get("score", 0.0)) >= threshold]
+        if not filtered_hits:
+            low_conf = True
+            effective_hits: list[dict] = []
+            max_score = 0.0
+        else:
+            max_score = max((float(item.get("score", 0.0)) for item in filtered_hits), default=0.0)
+            low_conf = max_score < threshold
+            effective_hits = [] if low_conf else filtered_hits
+
+        context = "\n\n".join([f"[{idx + 1}] {item['content']}" for idx, item in enumerate(effective_hits)])
         history_messages = await self._load_session_history(db=db, session_id=session_id)
-        system_prompt = (
-            "You are a customer support assistant. Answer based on provided context and recent conversation history. "
-            "Refuse illegal, unsafe, or unrelated requests."
-        )
+        if low_conf:
+            system_prompt = (
+                "You are a customer support assistant. Recent retrieval results are low-confidence. "
+                "Answer the user using your general knowledge and recent conversation history, and avoid fabricating "
+                "specific facts that are unlikely to be true. "
+                "Do not say things like 'based on all provided Context [1]-[8]'; answer directly and concisely, and only "
+                "refer to context pieces when they are clearly helpful."
+            )
+        else:
+            system_prompt = (
+                "You are a customer support assistant. Answer based on provided context and recent conversation history. "
+                "Refuse illegal, unsafe, or unrelated requests. "
+                "Do not say things like 'based on all provided Context [1]-[8]'; answer directly and concisely, and only "
+                "refer to specific context pieces when they are clearly helpful."
+            )
         user_prompt = f"Context:\n{context}\n\nQuestion:\n{question}"
         messages = [{"role": "system", "content": system_prompt}, *history_messages, {"role": "user", "content": user_prompt}]
 
-        yield {"event": "sources", "data": hits}
+        yield {"event": "sources", "data": effective_hits}
 
         parts: list[str] = []
         usage_prompt_tokens = 0
@@ -207,22 +246,40 @@ class RagService:
                 messages.append({"role": "assistant", "content": row.answer})
         return messages
 
-    async def _rerank_hits(self, query_embedding: list[float], hits: list[dict], final_top_k: int) -> tuple[list[dict], int]:
+    async def _rerank_hits(
+        self,
+        query_text: str,
+        query_embedding: list[float],
+        hits: list[dict],
+        final_top_k: int,
+    ) -> tuple[list[dict], int]:
         if not hits:
             return [], 0
         candidates = hits[: max(final_top_k, self.settings.top_k)]
         candidate_docs = [item.get("content", "")[: self.settings.embedding_max_chunk_chars] for item in candidates]
         try:
-            candidate_embeddings, rerank_tokens = await self.client.embed_texts(candidate_docs)
+            rerank_scores, rerank_tokens = await self.client.rerank_texts(query=query_text, documents=candidate_docs)
+            if len(rerank_scores) != len(candidates):
+                raise ValueError("invalid_rerank_scores_length")
+            for idx, item in enumerate(candidates):
+                rerank_score = float(rerank_scores[idx])
+                item["rerank_score"] = rerank_score
+                item["score"] = rerank_score
+            reranked = sorted(candidates, key=lambda row: row.get("rerank_score", 0.0), reverse=True)[:final_top_k]
+            return reranked, rerank_tokens
         except Exception:
-            return candidates[:final_top_k], 0
+            # Fallback for API/model transient issues: use embedding cosine rerank.
+            try:
+                candidate_embeddings, rerank_tokens = await self.client.embed_texts(candidate_docs)
+            except Exception:
+                return candidates[:final_top_k], 0
 
-        for idx, item in enumerate(candidates):
-            rerank_score = self._cosine_similarity(query_embedding, candidate_embeddings[idx])
-            item["rerank_score"] = rerank_score
-            item["score"] = rerank_score
-        reranked = sorted(candidates, key=lambda row: row.get("rerank_score", 0.0), reverse=True)[:final_top_k]
-        return reranked, rerank_tokens
+            for idx, item in enumerate(candidates):
+                rerank_score = self._cosine_similarity(query_embedding, candidate_embeddings[idx])
+                item["rerank_score"] = rerank_score
+                item["score"] = rerank_score
+            reranked = sorted(candidates, key=lambda row: row.get("rerank_score", 0.0), reverse=True)[:final_top_k]
+            return reranked, rerank_tokens
 
     def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
         if not left or not right or len(left) != len(right):

@@ -29,6 +29,7 @@ class DashScopeClient:
             "model": self.settings.dashscope_llm_model,
             "messages": messages,
             "stream": True,
+            "enable_thinking": self.settings.dashscope_enable_thinking,
         }
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream("POST", url, headers=self.headers, json=body) as resp:
@@ -71,6 +72,7 @@ class DashScopeClient:
             ],
             "stream": False,
             "temperature": 0.2,
+            "enable_thinking": self.settings.dashscope_enable_thinking,
         }
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, headers=self.headers, json=body)
@@ -84,3 +86,28 @@ class DashScopeClient:
         if not content:
             return question
         return content[:max_chars]
+
+    async def rerank_texts(self, query: str, documents: list[str]) -> tuple[list[float], int]:
+        if not query.strip() or not documents:
+            return [], 0
+        url = f"{self.settings.dashscope_base_url}/rerank"
+        body = {
+            "model": self.settings.dashscope_rerank_model,
+            "query": query,
+            "documents": documents,
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, headers=self.headers, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+
+        output = data.get("output", {}) or {}
+        results = output.get("results", []) or []
+        scores = [0.0] * len(documents)
+        for item in results:
+            idx = int(item.get("index", -1))
+            if 0 <= idx < len(scores):
+                scores[idx] = float(item.get("relevance_score", 0.0))
+        usage = data.get("usage", {}) or {}
+        token_count = int(usage.get("total_tokens", usage.get("input_tokens", 0)) or 0)
+        return scores, token_count

@@ -27,20 +27,32 @@ class VectorStore:
         self._invalidate_bm25()
 
     def search(self, query_embedding: list[float], top_k: int) -> list[dict]:
-        result = self.collection.query(query_embeddings=[query_embedding], n_results=top_k)
-        docs = result.get("documents", [[]])[0]
-        metas = result.get("metadatas", [[]])[0]
-        dists = result.get("distances", [[]])[0]
-        ids = result.get("ids", [[]])[0]
-        return [
-            {
-                "id": ids[idx],
-                "content": docs[idx],
-                "metadata": metas[idx] or {},
-                "score": float(dists[idx]) if idx < len(dists) else 0.0,
-            }
-            for idx in range(len(docs))
-        ]
+        max_count = int(self.collection.count() or 0)
+        if max_count <= 0:
+            return []
+        n_results = max(1, min(int(top_k), max_count))
+        while n_results >= 1:
+            try:
+                result = self.collection.query(query_embeddings=[query_embedding], n_results=n_results)
+                docs = result.get("documents", [[]])[0]
+                metas = result.get("metadatas", [[]])[0]
+                dists = result.get("distances", [[]])[0]
+                ids = result.get("ids", [[]])[0]
+                return [
+                    {
+                        "id": ids[idx],
+                        "content": docs[idx],
+                        "metadata": metas[idx] or {},
+                        "score": float(dists[idx]) if idx < len(dists) else 0.0,
+                    }
+                    for idx in range(len(docs))
+                ]
+            except RuntimeError:
+                # Chroma HNSW can fail on some fragmented states; degrade k progressively.
+                if n_results == 1:
+                    return []
+                n_results = max(1, n_results // 2)
+        return []
 
     def search_hybrid(
         self,
@@ -52,6 +64,44 @@ class VectorStore:
         dense_hits = self.search(query_embedding=query_embedding, top_k=max(top_k, dense_candidate_k))
         bm25_hits = self._search_bm25(query_text=query_text, top_k=max(top_k, dense_candidate_k))
         return self._merge_hybrid(dense_hits=dense_hits, bm25_hits=bm25_hits, top_k=top_k)
+
+    def search_balanced_hybrid(
+        self,
+        query_text: str,
+        query_embedding: list[float],
+        top_k: int,
+        dense_candidate_k: int,
+        per_file_top_n: int,
+        candidate_top_k: int,
+    ) -> list[dict]:
+        candidates = self.search_hybrid(
+            query_text=query_text,
+            query_embedding=query_embedding,
+            top_k=max(top_k, candidate_top_k),
+            dense_candidate_k=max(dense_candidate_k, candidate_top_k),
+        )
+        selected: list[dict] = []
+        per_file_count: dict[str, int] = {}
+        for item in candidates:
+            file_id = str(item.get("metadata", {}).get("file_id", ""))
+            if not file_id:
+                continue
+            current = per_file_count.get(file_id, 0)
+            if current >= per_file_top_n:
+                continue
+            per_file_count[file_id] = current + 1
+            selected.append(item)
+            if len(selected) >= top_k:
+                break
+        if len(selected) < top_k:
+            selected_ids = {row["id"] for row in selected}
+            for item in candidates:
+                if item["id"] in selected_ids:
+                    continue
+                selected.append(item)
+                if len(selected) >= top_k:
+                    break
+        return sorted(selected, key=lambda row: float(row.get("score", 0.0)), reverse=True)[:top_k]
 
     def delete_by_file_id(self, file_id: str) -> None:
         self.collection.delete(where={"file_id": file_id})

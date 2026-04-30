@@ -1,5 +1,6 @@
 import uuid
 import csv
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -95,7 +96,7 @@ class IngestService:
             return self._parse_xlsx_text(path)
         if suffix == ".pdf":
             reader = PdfReader(str(path))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
+            return "\n".join(self._clean_pdf_text(page.extract_text() or "") for page in reader.pages)
         return ""
 
     def _iter_chunks(self, path: Path):
@@ -119,7 +120,7 @@ class IngestService:
             if len(reader.pages) > self.settings.max_pdf_pages:
                 raise HTTPException(status_code=400, detail=f"PDF pages exceed limit: {self.settings.max_pdf_pages}")
             for page in reader.pages:
-                text = page.extract_text() or ""
+                text = self._clean_pdf_text(page.extract_text() or "")
                 total_chars += len(text)
                 if total_chars > self.settings.max_pdf_chars:
                     raise HTTPException(
@@ -205,6 +206,30 @@ class IngestService:
             # Ensure forward progress even when overlap is larger than the effective window.
             next_cursor = max(end - overlap, 0)
             cursor = next_cursor if next_cursor > cursor else cursor + 1
+
+    def _clean_pdf_text(self, text: str) -> str:
+        # Remove invisible control characters that often appear in OCR/PDF extraction.
+        cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
+        cleaned = cleaned.replace("\u3000", " ")
+
+        lines = []
+        for raw in cleaned.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            # Remove page markers from extracted content.
+            if re.match(r"^--\s*\d+\s+of\s+\d+\s*--$", line):
+                continue
+            # Skip short noisy lines that are mostly symbols/garbled characters.
+            alnum_or_cjk = sum(1 for ch in line if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"))
+            ratio = alnum_or_cjk / max(len(line), 1)
+            if len(line) <= 8 and ratio < 0.4:
+                continue
+            lines.append(line)
+
+        merged = "\n".join(lines)
+        merged = re.sub(r"[ \t]{2,}", " ", merged)
+        return merged.strip()
 
     def _parse_csv_text(self, path: Path) -> str:
         rows: list[str] = []
