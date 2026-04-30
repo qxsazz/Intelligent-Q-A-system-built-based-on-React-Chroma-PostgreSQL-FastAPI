@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     environment: str = "dev"
     log_level: str = "INFO"
     reduce_noise_logs: bool = True
+    cors_allow_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+    cors_allow_credentials: bool = False
 
     dashscope_api_key: str = ""
     dashscope_embedding_model: str = "text-embedding-v3"
@@ -50,6 +52,10 @@ class Settings(BaseSettings):
     def ensure_dirs(self) -> None:
         Path(self.vector_persist_dir).mkdir(parents=True, exist_ok=True)
         Path(self.upload_dir).mkdir(parents=True, exist_ok=True)
+
+    def get_cors_origins(self) -> list[str]:
+        origins = [item.strip() for item in self.cors_allow_origins.split(",") if item.strip()]
+        return origins or ["http://127.0.0.1:5173", "http://localhost:5173"]
 
 
 @lru_cache
